@@ -3,227 +3,303 @@ import pandas as pd
 import json
 import os
 from io import BytesIO
-import sys
+from openpyxl import load_workbook
 
+# ---------------- Utils ----------------
+def load_dataframe(file, sheet_name=None):
+    filename = file.name.lower() if hasattr(file, "name") else file.lower()
+
+    if filename.endswith(".csv"):
+        df = pd.read_csv(file)
+    elif filename.endswith(".xlsx"):
+        if sheet_name is None:
+            raise ValueError("sheet_name is required for Excel files")
+        
+        # Use openpyxl to read the actual data and find max column
+        if hasattr(file, 'read'):
+            file.seek(0)
+            wb = load_workbook(file)
+        else:
+            wb = load_workbook(file)
+        
+        ws = wb[sheet_name]
+        
+        # Read the data manually to get proper headers from row 1 and row 2
+        headers = []
+        data = []
+        
+        # Read header rows (1 and 2)
+        for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=2, values_only=True), 1):
+            # Only keep columns up to the max used column
+            row = row[:ws.max_column]
+            if row_idx == 1:
+                row1 = row
+            elif row_idx == 2:
+                row2 = row
+        
+        # Combine headers from row 1 and row 2
+        for i, (h1, h2) in enumerate(zip(row1, row2)):
+            h1_str = str(h1).strip() if h1 else ""
+            h2_str = str(h2).strip() if h2 else ""
+            
+            # Combine headers
+            if h1_str and h2_str and h1_str != h2_str:
+                combined = f"{h1_str} - {h2_str}"
+            elif h1_str:
+                combined = h1_str
+            elif h2_str:
+                combined = h2_str
+            else:
+                combined = f"Column_{i}"
+            
+            headers.append(combined)
+        
+        # Read data rows (skip header rows)
+        for row in ws.iter_rows(min_row=3, values_only=True):
+            row = row[:ws.max_column]
+            data.append(row)
+        
+        wb.close()
+        
+        # Create dataframe
+        df = pd.DataFrame(data, columns=headers)
+        
+        # Filter out invalid columns
+        valid_columns = []
+        for col in df.columns:
+            col_str = str(col).strip()
+            if (col_str and 
+                'unnamed' not in col_str.lower() and 
+                col_str.lower() != 'nan' and
+                col_str != '' and
+                not col_str.startswith('Column_')):
+                valid_columns.append(col)
+        
+        df = df[valid_columns]
+        
+        # Make column names unique by adding counter if duplicates exist
+        seen = {}
+        unique_cols = []
+        for col in df.columns:
+            if col in seen:
+                seen[col] += 1
+                unique_cols.append(f"{col}_{seen[col]}")
+            else:
+                seen[col] = 0
+                unique_cols.append(col)
+        df.columns = unique_cols
+    else:
+        raise ValueError("Unsupported file type")
+    
+    return df
+
+# ---------------- App Config ----------------
 st.set_page_config(page_title="Smart Excel Merger", layout="wide")
 st.title("📊 Smart Excel Merger with Column Mapping")
 
-BASE_DIR = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__)
+BASE_DIR = os.getcwd()
+DATA_DIR = os.path.join(BASE_DIR, "data")
 MAPPING_DIR = os.path.join(BASE_DIR, "mappings")
 
-DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
-
-TEMPLATE_PATH = os.path.join(DATA_DIR, "template.xlsx")
 os.makedirs(MAPPING_DIR, exist_ok=True)
 
+TEMPLATE_PATH = os.path.join(DATA_DIR, "template.xlsx")
+
+# ---------------- Session State ----------------
+st.session_state.setdefault("column_mapping", {})
+st.session_state.setdefault("merge_keys", [])
+st.session_state.setdefault("mapping_confirmed", False)
+
+# ---------------- Template ----------------
 st.subheader("📌 Template File")
 
-template_exists = os.path.exists(TEMPLATE_PATH)
+template_ready = False
 
-if template_exists:
+if os.path.exists(TEMPLATE_PATH):
     st.success("✅ Template file is set")
+    template_ready = True
     if st.button("🔄 Replace Template"):
         os.remove(TEMPLATE_PATH)
-        st.experimental_rerun()
+        st.session_state.clear()
+        st.rerun()
 else:
-    template_file = st.file_uploader(
-        "Upload Template Excel (one-time)",
-        type=["xlsx"]
-    )
-
-    if template_file:
+    st.warning("No template file found. Please upload one to get started.")
+    uploaded_template = st.file_uploader("Upload Template Excel", type=["xlsx"])
+    if uploaded_template:
         with open(TEMPLATE_PATH, "wb") as f:
-            f.write(template_file.getbuffer())
-        st.success("Template saved successfully!")
-        st.experimental_rerun()
+            f.write(uploaded_template.getbuffer())
+        st.success("Template saved!")
+        st.rerun()
 
-if not os.path.exists(TEMPLATE_PATH):
-    st.info("Please upload the template file to continue.")
+if not template_ready:
     st.stop()
 
-# ------------------------------------
-# File Upload
-# ------------------------------------
-file2 = st.file_uploader("Upload Excel File B", type=["xlsx"], key="file2")
-
-if not (template_file and file2):
-    st.info("Upload both Excel files to continue.")
+# ---------------- Upload File B ----------------
+file_b = st.file_uploader("Upload Excel or CSV File B", type=["xlsx", "csv"])
+if not file_b:
     st.stop()
 
-# Wrap everything in a try block or use if/else properly
-try:
-        excel1 = pd.ExcelFile(template_file)
-        excel2 = pd.ExcelFile(file2)
-        
-        # ------------------------------------
-        # Sheet Selection
-        # ------------------------------------
-        col1, col2 = st.columns(2)
+# ---------------- Read Template ----------------
+excel_a = pd.ExcelFile(TEMPLATE_PATH)
+sheet_a = st.selectbox("Select sheet from Template", excel_a.sheet_names)
+df_a = load_dataframe(TEMPLATE_PATH, sheet_name=sheet_a)
 
-        with col1:
-                sheet1 = st.selectbox("Select sheet from File A", excel1.sheet_names)
+# ---------------- Read File B ----------------
+if file_b.name.lower().endswith(".xlsx"):
+    excel_b = pd.ExcelFile(file_b)
+    sheet_b = st.selectbox("Select sheet from File B", excel_b.sheet_names)
+    df_b = load_dataframe(file_b, sheet_name=sheet_b)
+else:
+    st.info("CSV detected — no sheet selection needed")
+    df_b = load_dataframe(file_b)
 
-        with col2:
-                sheet2 = st.selectbox("Select sheet from File B", excel2.sheet_names)
+# ---------------- Row Count ----------------
+st.subheader("📈 Row Count (Before Merge)")
+c1, c2 = st.columns(2)
+c1.metric("Template Rows", len(df_a))
+c2.metric("File B Rows", len(df_b))
 
-        df1 = pd.read_excel(excel1, sheet_name=sheet1)
-        df2 = pd.read_excel(excel2, sheet_name=sheet2)
+# ---------------- Load Mapping ----------------
+st.subheader("💾 Load Column Mapping (Optional)")
+mapping_files = [f for f in os.listdir(MAPPING_DIR) if f.endswith(".json")]
+selected_mapping = st.selectbox("Select saved mapping", ["None"] + mapping_files)
 
-        # ------------------------------------
-        # Row Count (Before)
-        # ------------------------------------
-        st.subheader("📈 Row Count (Before Merge)")
-        c1, c2 = st.columns(2)
-        c1.metric("File A Rows", len(df1))
-        c2.metric("File B Rows", len(df2))
+if selected_mapping != "None":
+    with open(os.path.join(MAPPING_DIR, selected_mapping)) as f:
+        saved = json.load(f)
+        st.session_state.column_mapping = saved["column_mapping"]
+        st.session_state.merge_keys = saved["merge_keys"]
+        st.session_state.mapping_confirmed = True
+    st.success(f"Loaded mapping: {selected_mapping}")
 
-        # ------------------------------------
-        # Load Saved Mapping
-        # ------------------------------------
-        st.subheader("💾 Load Column Mapping (Optional)")
+# ---------------- Column Mapping (FORM) ----------------
+st.subheader("🧩 Column Mapping (Template → File B)")
 
-        mapping_files = [f for f in os.listdir(MAPPING_DIR) if f.endswith(".json")]
-        selected_mapping = st.selectbox(
-        "Select saved mapping",
-        ["None"] + mapping_files
-        )
+# Show helpful info about the columns
+col1, col2 = st.columns(2)
+with col1:
+    st.info(f"📋 Template has {len(df_a.columns)} columns: {', '.join(df_a.columns.tolist())}")
+with col2:
+    st.info(f"📋 File B has {len(df_b.columns)} columns: {', '.join(df_b.columns.tolist())}")
 
-        column_mapping = {}
+st.markdown("---")
+st.markdown("**Map each Template column to a File B column (or Ignore it):**")
 
-        if selected_mapping != "None":
-                try:
-                        with open(os.path.join(MAPPING_DIR, selected_mapping)) as f:
-                                column_mapping = json.load(f)
-                        st.success(f"Loaded mapping: {selected_mapping}")
-                except Exception as e:
-                        st.error(f"Error loading mapping: {e}")
-        # ------------------------------------
-        # Column Mapping UI
-        # ------------------------------------
-        st.subheader("🧩 Column Mapping (File A → File B)")
+with st.form("column_mapping_form"):
+    temp_mapping = {}
+    temp_keys = []
 
-        # Add merge key selection
-        st.info("Select which columns to use as merge keys (must map to same columns in both files)")
+    # Create a container for the mappings
+    with st.container():
+        # Display column mappings with better clarity
+        for col_idx, col in enumerate(df_a.columns):
+            st.markdown(f"**Template Column: `{col}`**")
+            col_map, col_key, col_preview = st.columns([2, 1, 1])
 
-        mapped_columns = {}
-        merge_keys = []
+            default = st.session_state.column_mapping.get(col, "Ignore")
 
-        for col in df1.columns:
-                col_container = st.container()
-                with col_container:
-                        col_map, col_key = st.columns([3, 1])
-                        
-                with col_map:
-                        default_value = column_mapping.get(col, "Ignore")
-                        selected = st.selectbox(
-                                f"{col} maps to",
-                                ["Ignore"] + list(df2.columns),
-                                index=(["Ignore"] + list(df2.columns)).index(default_value)
-                                if default_value in ["Ignore"] + list(df2.columns) else 0,
-                                key=f"map_{col}"
-                        )
-                
-                with col_key:
-                        if selected != "Ignore":
-                                is_key = st.checkbox("Merge Key", key=f"key_{col}")
-                                mapped_columns[col] = selected
-                                if is_key:
-                                        merge_keys.append(selected)
+            with col_map:
+                selected = st.selectbox(
+                    f"Maps to",
+                    ["Ignore"] + list(df_b.columns),
+                    key=f"map_{col_idx}_{col}",  # Add index to ensure uniqueness
+                    index=(["Ignore"] + list(df_b.columns)).index(default)
+                    if default in ["Ignore"] + list(df_b.columns) else 0,
+                    label_visibility="collapsed"
+                )
 
-        if not mapped_columns:
-                st.warning("Please map at least one column.")
-                st.stop()
+            with col_key:
+                is_key = st.checkbox(
+                    "Merge Key?",
+                    key=f"merge_key_{col_idx}_{col}",  # Add index to ensure uniqueness
+                    value=col in st.session_state.merge_keys
+                )
 
-        if not merge_keys:
-                st.warning("Please select at least one merge key column.")
-                st.stop()
+            with col_preview:
+                if selected != "Ignore":
+                    sample_a = str(df_a[col].dropna().iloc[0] if len(df_a[col].dropna()) > 0 else "")[:20]
+                    sample_b = str(df_b[selected].dropna().iloc[0] if len(df_b[selected].dropna()) > 0 else "")[:20]
+                    st.caption(f"Sample: '{sample_a}' → '{sample_b}'")
 
-        # ------------------------------------
-        # Save Mapping
-        # ------------------------------------
-        st.subheader("💾 Save Mapping Configuration")
+            if selected != "Ignore":
+                temp_mapping[col] = selected
+                if is_key:
+                    temp_keys.append(col)
+            
+            st.markdown("")  # Add spacing between rows
 
-        mapping_name = st.text_input("Mapping name (e.g. customer_merge)")
+    submitted = st.form_submit_button("✅ Confirm Mapping")
 
-        if st.button("Save Mapping"):
-                if mapping_name:
-                        try:
-                                mapping_data = {
-                                        "column_mapping": mapped_columns,
-                                        "merge_keys": merge_keys
-                                }
-                                with open(f"{MAPPING_DIR}/{mapping_name}.json", "w") as f:
-                                        json.dump(mapping_data, f, indent=2)
-                                st.success("Mapping saved successfully!")
-                        except Exception as e:
-                                st.error(f"Error saving mapping: {e}")
+if submitted:
+    if not temp_mapping:
+        st.error("Map at least one column.")
+        st.stop()
+
+    st.session_state.column_mapping = temp_mapping
+    st.session_state.merge_keys = temp_keys
+    st.session_state.mapping_confirmed = True
+    st.success("Mapping confirmed!")
+
+# ---------------- Save Mapping ----------------
+if st.session_state.mapping_confirmed:
+    st.subheader("💾 Save Mapping")
+    mapping_name = st.text_input("Mapping name")
+
+    if st.button("Save Mapping"):
+        if not mapping_name:
+            st.error("Please enter a mapping name.")
         else:
-                st.error("Please enter a mapping name.")
+            with open(os.path.join(MAPPING_DIR, f"{mapping_name}.json"), "w") as f:
+                json.dump(
+                    {
+                        "column_mapping": st.session_state.column_mapping,
+                        "merge_keys": st.session_state.merge_keys,
+                    },
+                    f,
+                    indent=2,
+                )
+            st.success("Mapping saved!")
 
-        # ------------------------------------
-        # Merge Options
-        # ------------------------------------
-        st.subheader("🔀 Merge Options")
+# ---------------- Merge ----------------
+if st.session_state.mapping_confirmed:
+    st.subheader("🔀 Fill Template with Data")
 
-        join_type = st.selectbox(
-        "Merge type",
-        ["inner", "left", "right", "outer"],
-        help="inner: only matching rows | left: all from A | right: all from B | outer: all rows"
+    if st.button("🚀 Fill Template"):
+        # Create a copy of the template to fill
+        filled_df = df_a.copy()
+        
+        # Fill the first column with serial numbers
+        if len(filled_df.columns) > 0:
+            first_column = filled_df.columns[0]
+            filled_df[first_column] = range(1, len(filled_df) + 1)
+        
+        # For each mapped column, copy data from File B to template
+        for template_col, file_b_col in st.session_state.column_mapping.items():
+            if file_b_col in df_b.columns:
+                # Get the data from File B (handle different row counts)
+                if len(df_b) >= len(filled_df):
+                    # File B has more or equal rows - take as many as we need
+                    filled_df[template_col] = df_b[file_b_col].iloc[:len(filled_df)].values
+                else:
+                    # File B has fewer rows - fill what we can, rest remains empty
+                    filled_df[template_col] = pd.NA
+                    filled_df.loc[:len(df_b)-1, template_col] = df_b[file_b_col].values
+
+        st.subheader("📊 Template Filled with Data")
+        m1, m2 = st.columns(2)
+        m1.metric("Template Rows", len(df_a))
+        m2.metric("Mapped Columns Updated", len(st.session_state.column_mapping))
+
+        st.dataframe(filled_df.head(50))
+
+        output = BytesIO()
+        filled_df.to_excel(output, index=False)
+        output.seek(0)
+
+        st.download_button(
+            "⬇️ Download Filled Template",
+            output,
+            "filled_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-
-        # ------------------------------------
-        # Perform Merge
-        # ------------------------------------
-        if st.button("🚀 Merge Files"):
-                try:
-                        # Rename columns in df1 to match df2
-                        df1_renamed = df1.rename(columns=mapped_columns)
-                        
-                        # Perform merge
-                        merged_df = pd.merge(
-                        df1_renamed,
-                        df2,
-                        on=merge_keys,
-                        how=join_type,
-                        suffixes=('_A', '_B')
-                        )
-
-                        # ------------------------------------
-                        # Row Count (After)
-                        # ------------------------------------
-                        st.subheader("📊 Row Count (After Merge)")
-                        m1, m2, m3 = st.columns(3)
-                        m1.metric("File A Rows", len(df1))
-                        m2.metric("File B Rows", len(df2))
-                        m3.metric("Merged Rows", len(merged_df))
-
-                        # ------------------------------------
-                        # Preview
-                        # ------------------------------------
-                        st.subheader("✅ Merged Preview")
-                        st.dataframe(merged_df.head(50))
-
-                        # ------------------------------------
-                        # Download
-                        # ------------------------------------
-                        # Use BytesIO instead of writing to disk
-                        output = BytesIO()
-                        merged_df.to_excel(output, index=False, engine='openpyxl')
-                        output.seek(0)
-
-                        st.download_button(
-                        "⬇️ Download Merged Excel",
-                        output,
-                        file_name="merged_output.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                
-                except Exception as e:
-                        st.error(f"❌ Merge failed: {e}")
-                        st.exception(e)
-    
-except Exception as e:
-    st.error(f"❌ Failed to read Excel file: {e}")
-    st.stop()
-

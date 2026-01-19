@@ -1,0 +1,11 @@
+{
+  "column_mapping": {
+    "Feature ID": "Issue key",
+    "Description": "Summary",
+    "Functional Lead": "Assignee",
+    "Status": "Status"
+  },
+  "merge_keys": [
+    "Feature ID"
+  ]
+}
